@@ -1,8 +1,4 @@
 .env
 env
 
-node_modules
-/node_modules
-
-
-asdf
+node_modules/
