@@ -7,15 +7,22 @@ const VNA_OTP_PATTERN =
 
 const SIX_DIGIT_PATTERN = /\b(\d{6})\b/;
 
+const OTP_TTL_MS = 5 * 60 * 1000;
+
 // ==========================================
 // TEMP CACHE
+//
+// key:
+// vu.h.o.angson3000@gmail.com
+//
+// value:
+// {
+//   otp: "289984",
+//   expiredAt: 123456789
+// }
 // ==========================================
 
-let lastHistoryId = null;
-
-let latestOtp = null;
-
-let otpExpiredAt = null;
+const otpCache = new Map();
 
 const processedMessageIds = new Set();
 
@@ -44,6 +51,7 @@ const gmail = google.gmail({
 async function watch() {
   const response = await gmail.users.watch({
     userId: "me",
+
     requestBody: {
       topicName: process.env.GMAIL_TOPIC_NAME,
 
@@ -53,10 +61,9 @@ async function watch() {
     },
   });
 
-  lastHistoryId = response.data.historyId;
-
   console.log("Gmail watch registered:", {
     historyId: response.data.historyId,
+
     expiration: response.data.expiration,
   });
 
@@ -64,7 +71,7 @@ async function watch() {
 }
 
 // ==========================================
-// PROCESS PUBSUB NOTIFICATION
+// PROCESS PUB/SUB NOTIFICATION
 // ==========================================
 
 async function processNotification(requestBody) {
@@ -72,53 +79,43 @@ async function processNotification(requestBody) {
 
   if (!data) {
     console.log("Pub/Sub message data is empty");
+
     return;
   }
 
-  // ----------------------------------------
-  // 1. Decode Pub/Sub message
-  // ----------------------------------------
+  // ========================================
+  // Decode Pub/Sub message
+  // ========================================
 
   const decoded = Buffer.from(data, "base64").toString("utf8");
 
   const notification = JSON.parse(decoded);
 
-  const currentHistoryId = notification.historyId;
-
   console.log("Gmail notification:", {
     emailAddress: notification.emailAddress,
 
-    historyId: currentHistoryId,
+    historyId: notification.historyId,
   });
 
-  // ----------------------------------------
-  // 2. Có notification
-  //    -> search email VNA mới nhất
-  // ----------------------------------------
+  // ========================================
+  // Có Gmail notification
+  // -> lấy những mail VNA gần nhất
+  // ========================================
 
   await processLatestVnaEmails();
-
-  // ----------------------------------------
-  // 3. Update historyId
-  //    chỉ giữ để log/checkpoint
-  // ----------------------------------------
-
-  lastHistoryId = currentHistoryId;
 }
 
 // ==========================================
-// GET LATEST VNA EMAILS
+// SEARCH VNA EMAILS
 // ==========================================
 
 async function processLatestVnaEmails() {
   const response = await gmail.users.messages.list({
     userId: "me",
 
-    // Chỉ search mail từ VNA
-    // và chỉ mail trong vòng 1 ngày gần nhất
-    q: `from:${VNA_OTP_SENDER} newer_than:1d`,
+    q: `from:${VNA_OTP_SENDER} ` + "newer_than:1d",
 
-    maxResults: 10,
+    maxResults: 20,
 
     includeSpamTrash: false,
   });
@@ -131,14 +128,22 @@ async function processLatestVnaEmails() {
   );
 
   if (messages.length === 0) {
-    console.log("No Vietnam Airlines emails found");
-
     return;
   }
 
-  // Gmail thường trả newest trước.
-  // Process tất cả message chưa xử lý.
-  for (const message of messages) {
+  /*
+   * Gmail thường trả newest -> oldest.
+   *
+   * Ta reverse thành:
+   *
+   * oldest -> newest
+   *
+   * để nếu cùng email alias có nhiều OTP
+   * thì OTP mới nhất được ghi cuối cùng.
+   */
+  const orderedMessages = [...messages].reverse();
+
+  for (const message of orderedMessages) {
     const messageId = message.id;
 
     if (!messageId) {
@@ -158,17 +163,9 @@ async function processLatestVnaEmails() {
 // ==========================================
 
 async function processMessage(messageId) {
-  // ----------------------------------------
-  // chống duplicate
-  // ----------------------------------------
-
   if (processedMessageIds.has(messageId)) {
     return;
   }
-
-  // ----------------------------------------
-  // GET MESSAGE
-  // ----------------------------------------
 
   const response = await gmail.users.messages.get({
     userId: "me",
@@ -186,35 +183,37 @@ async function processMessage(messageId) {
     return;
   }
 
-  // ----------------------------------------
-  // GET HEADER
-  // ----------------------------------------
-
   const headers = payload.headers || [];
 
+  // ========================================
+  // HEADERS
+  // ========================================
+
   const from = getHeader(headers, "From");
+
+  const to = getHeader(headers, "To");
+
+  const deliveredTo = getHeader(headers, "Delivered-To");
+
+  const originalTo = getHeader(headers, "X-Original-To");
 
   const subject = getHeader(headers, "Subject");
 
   const date = getHeader(headers, "Date");
 
-  const to = getHeader(headers, "To");
-  const deliveredTo = getHeader(headers, "Delivered-To");
-  const originalTo = getHeader(headers, "X-Original-To");
-
   console.log("Gmail message:", {
     messageId,
     from,
     to,
-    date,
     deliveredTo,
     originalTo,
     subject,
+    date,
   });
 
-  // ----------------------------------------
-  // Chỉ xử lý email Vietnam Airlines
-  // ----------------------------------------
+  // ========================================
+  // Chỉ xử lý VNA
+  // ========================================
 
   if (!from || !from.toLowerCase().includes(VNA_OTP_SENDER.toLowerCase())) {
     processedMessageIds.add(messageId);
@@ -222,9 +221,35 @@ async function processMessage(messageId) {
     return;
   }
 
-  // ----------------------------------------
+  // ========================================
+  // LẤY EMAIL ALIAS NHẬN MAIL
+  //
+  // Ưu tiên To vì đây thường chính là địa chỉ
+  // VNA đã gửi tới:
+  //
+  // vu.h.o.angson3000@gmail.com
+  //
+  // chứ không normalize mất dấu "."
+  // ========================================
+
+  const recipientEmail = extractRecipientEmail(to, originalTo, deliveredTo);
+
+  if (!recipientEmail) {
+    console.log("Cannot determine recipient email", {
+      messageId,
+      to,
+      originalTo,
+      deliveredTo,
+    });
+
+    processedMessageIds.add(messageId);
+
+    return;
+  }
+
+  // ========================================
   // EXTRACT BODY
-  // ----------------------------------------
+  // ========================================
 
   const body = extractBody(payload);
 
@@ -238,15 +263,16 @@ async function processMessage(messageId) {
     return;
   }
 
-  // ----------------------------------------
+  // ========================================
   // EXTRACT OTP
-  // ----------------------------------------
+  // ========================================
 
   const otp = extractOtp(body);
 
   if (!otp) {
     console.log("VNA email found but OTP not found", {
       messageId,
+      recipientEmail,
     });
 
     processedMessageIds.add(messageId);
@@ -254,48 +280,154 @@ async function processMessage(messageId) {
     return;
   }
 
-  // ----------------------------------------
-  // CACHE OTP 5 PHÚT
-  // ----------------------------------------
+  // ========================================
+  // CACHE OTP THEO EMAIL ALIAS
+  // ========================================
 
-  latestOtp = otp;
+  const cacheKey = normalizeEmail(recipientEmail);
 
-  otpExpiredAt = Date.now() + 5 * 60 * 1000;
+  otpCache.set(cacheKey, {
+    otp,
+    expiredAt: Date.now() + OTP_TTL_MS,
 
-  console.log("Vietnam Airlines OTP received successfully", {
     messageId,
-    subject,
+  });
+
+  console.log("Vietnam Airlines OTP cached successfully", {
+    messageId,
+    recipientEmail: cacheKey,
   });
 
   // DEV ONLY
-  // Production thì nên bỏ log OTP
   console.log("OTP:", otp);
-
-  // ----------------------------------------
-  // MARK PROCESSED
-  // ----------------------------------------
 
   processedMessageIds.add(messageId);
 }
 
 // ==========================================
-// GET LATEST OTP
+// GET OTP BY EMAIL
 // ==========================================
 
-function getLatestOtp() {
-  if (!latestOtp) {
+function getLatestOtp(email) {
+  if (!email) {
     return null;
   }
 
-  // OTP hết hạn
-  if (otpExpiredAt && Date.now() > otpExpiredAt) {
-    latestOtp = null;
-    otpExpiredAt = null;
+  const normalizedEmail = normalizeEmail(email);
+
+  const cached = otpCache.get(normalizedEmail);
+
+  if (!cached) {
+    return null;
+  }
+
+  // ========================================
+  // Check TTL
+  // ========================================
+
+  if (Date.now() > cached.expiredAt) {
+    otpCache.delete(normalizedEmail);
 
     return null;
   }
 
-  return latestOtp;
+  return {
+    email: normalizedEmail,
+
+    otp: cached.otp,
+  };
+}
+
+// ==========================================
+// NORMALIZE EMAIL
+//
+// vu.h.o.angson3000
+//
+// ->
+//
+// vu.h.o.angson3000@gmail.com
+//
+// QUAN TRỌNG:
+// KHÔNG xóa dấu "."
+// ==========================================
+
+function normalizeEmail(email) {
+  let value = email.trim().toLowerCase();
+
+  if (!value.includes("@")) {
+    value += "@gmail.com";
+  }
+
+  return value;
+}
+
+// ==========================================
+// EXTRACT RECIPIENT EMAIL
+// ==========================================
+
+function extractRecipientEmail(to, originalTo, deliveredTo) {
+  /*
+   * Ưu tiên To.
+   *
+   * Vì đây thường giữ đúng alias mà bên VNA
+   * đã gửi tới.
+   */
+
+  const candidates = [to, originalTo, deliveredTo];
+
+  for (const candidate of candidates) {
+    const email = extractEmailAddress(candidate);
+
+    if (email) {
+      return email;
+    }
+  }
+
+  return null;
+}
+
+// ==========================================
+// EXTRACT EMAIL ADDRESS
+//
+// Input:
+//
+// Hoang Son <vu.h.o.angson3000@gmail.com>
+//
+// Output:
+//
+// vu.h.o.angson3000@gmail.com
+// ==========================================
+
+function extractEmailAddress(value) {
+  if (!value) {
+    return null;
+  }
+
+  /*
+   * Trường hợp:
+   *
+   * Name <email@gmail.com>
+   */
+
+  const angleMatch = value.match(/<([^<>@\s]+@[^<>@\s]+)>/);
+
+  if (angleMatch) {
+    return angleMatch[1].trim().toLowerCase();
+  }
+
+  /*
+   * Trường hợp:
+   *
+   * email@gmail.com
+   */
+
+  const emailMatch = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+
+  if (emailMatch) {
+    return emailMatch[0].trim().toLowerCase();
+  }
+
+  return null;
 }
 
 // ==========================================
@@ -319,14 +451,13 @@ function extractBody(part) {
     return null;
   }
 
-  // ----------------------------------------
-  // Body trực tiếp
-  // ----------------------------------------
+  // ========================================
+  // BODY TRỰC TIẾP
+  // ========================================
 
   if (part.body?.data) {
     let body = Buffer.from(part.body.data, "base64url").toString("utf8");
 
-    // HTML -> plain text đơn giản
     if (part.mimeType === "text/html") {
       body = body.replace(/<[^>]*>/g, " ");
     }
@@ -336,9 +467,9 @@ function extractBody(part) {
 
   const parts = part.parts || [];
 
-  // ----------------------------------------
-  // Ưu tiên text/plain
-  // ----------------------------------------
+  // ========================================
+  // ƯU TIÊN TEXT/PLAIN
+  // ========================================
 
   for (const child of parts) {
     if (child.mimeType === "text/plain") {
@@ -350,9 +481,9 @@ function extractBody(part) {
     }
   }
 
-  // ----------------------------------------
-  // Recursive fallback
-  // ----------------------------------------
+  // ========================================
+  // RECURSIVE FALLBACK
+  // ========================================
 
   for (const child of parts) {
     const body = extractBody(child);
@@ -370,19 +501,11 @@ function extractBody(part) {
 // ==========================================
 
 function extractOtp(body) {
-  // ----------------------------------------
-  // Pattern chính xác của VNA
-  // ----------------------------------------
-
   let matcher = body.match(VNA_OTP_PATTERN);
 
   if (matcher) {
     return matcher[1];
   }
-
-  // ----------------------------------------
-  // Fallback số 6 chữ số
-  // ----------------------------------------
 
   matcher = body.match(SIX_DIGIT_PATTERN);
 
