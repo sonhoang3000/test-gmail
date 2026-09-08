@@ -57,7 +57,6 @@ async function watch() {
 
   console.log("Gmail watch registered:", {
     historyId: response.data.historyId,
-
     expiration: response.data.expiration,
   });
 
@@ -93,66 +92,65 @@ async function processNotification(requestBody) {
   });
 
   // ----------------------------------------
-  // 2. Initialize checkpoint
+  // 2. Có notification
+  //    -> search email VNA mới nhất
   // ----------------------------------------
 
-  if (!lastHistoryId) {
-    lastHistoryId = currentHistoryId;
-
-    console.log("Initialize Gmail historyId:", lastHistoryId);
-
-    return;
-  }
+  await processLatestVnaEmails();
 
   // ----------------------------------------
-  // 3. Get history
-  // ----------------------------------------
-
-  await processHistory(lastHistoryId);
-
-  // ----------------------------------------
-  // 4. Update checkpoint
+  // 3. Update historyId
+  //    chỉ giữ để log/checkpoint
   // ----------------------------------------
 
   lastHistoryId = currentHistoryId;
 }
 
 // ==========================================
-// PROCESS HISTORY
+// GET LATEST VNA EMAILS
 // ==========================================
 
-async function processHistory(previousHistoryId) {
-  let pageToken;
+async function processLatestVnaEmails() {
+  const response = await gmail.users.messages.list({
+    userId: "me",
 
-  do {
-    const response = await gmail.users.history.list({
-      userId: "me",
+    // Chỉ search mail từ VNA
+    // và chỉ mail trong vòng 1 ngày gần nhất
+    q: `from:${VNA_OTP_SENDER} newer_than:1d`,
 
-      startHistoryId: previousHistoryId,
+    maxResults: 10,
 
-      historyTypes: ["messageAdded"],
+    includeSpamTrash: false,
+  });
 
-      pageToken,
-    });
+  const messages = response.data.messages || [];
 
-    const histories = response.data.history || [];
+  console.log(
+    "Latest VNA messageIds:",
+    messages.map((message) => message.id),
+  );
 
-    for (const history of histories) {
-      const messagesAdded = history.messagesAdded || [];
+  if (messages.length === 0) {
+    console.log("No Vietnam Airlines emails found");
 
-      for (const item of messagesAdded) {
-        const messageId = item.message?.id;
+    return;
+  }
 
-        if (!messageId) {
-          continue;
-        }
+  // Gmail thường trả newest trước.
+  // Process tất cả message chưa xử lý.
+  for (const message of messages) {
+    const messageId = message.id;
 
-        await processMessage(messageId);
-      }
+    if (!messageId) {
+      continue;
     }
 
-    pageToken = response.data.nextPageToken;
-  } while (pageToken);
+    if (processedMessageIds.has(messageId)) {
+      continue;
+    }
+
+    await processMessage(messageId);
+  }
 }
 
 // ==========================================
@@ -160,9 +158,17 @@ async function processHistory(previousHistoryId) {
 // ==========================================
 
 async function processMessage(messageId) {
+  // ----------------------------------------
+  // chống duplicate
+  // ----------------------------------------
+
   if (processedMessageIds.has(messageId)) {
     return;
   }
+
+  // ----------------------------------------
+  // GET MESSAGE
+  // ----------------------------------------
 
   const response = await gmail.users.messages.get({
     userId: "me",
@@ -175,8 +181,14 @@ async function processMessage(messageId) {
   const payload = message.payload;
 
   if (!payload) {
+    processedMessageIds.add(messageId);
+
     return;
   }
+
+  // ----------------------------------------
+  // GET HEADER
+  // ----------------------------------------
 
   const headers = payload.headers || [];
 
@@ -184,10 +196,13 @@ async function processMessage(messageId) {
 
   const subject = getHeader(headers, "Subject");
 
+  const date = getHeader(headers, "Date");
+
   console.log("Gmail message:", {
     messageId,
     from,
     subject,
+    date,
   });
 
   // ----------------------------------------
@@ -201,25 +216,31 @@ async function processMessage(messageId) {
   }
 
   // ----------------------------------------
-  // Extract body
+  // EXTRACT BODY
   // ----------------------------------------
 
   const body = extractBody(payload);
 
   if (!body) {
+    console.log("VNA email body is empty", {
+      messageId,
+    });
+
     processedMessageIds.add(messageId);
 
     return;
   }
 
   // ----------------------------------------
-  // Extract OTP
+  // EXTRACT OTP
   // ----------------------------------------
 
   const otp = extractOtp(body);
 
   if (!otp) {
-    console.log("VNA email found but OTP not found");
+    console.log("VNA email found but OTP not found", {
+      messageId,
+    });
 
     processedMessageIds.add(messageId);
 
@@ -227,7 +248,7 @@ async function processMessage(messageId) {
   }
 
   // ----------------------------------------
-  // CACHE OTP 5 phút
+  // CACHE OTP 5 PHÚT
   // ----------------------------------------
 
   latestOtp = otp;
@@ -236,10 +257,16 @@ async function processMessage(messageId) {
 
   console.log("Vietnam Airlines OTP received successfully", {
     messageId,
+    subject,
   });
 
-  // Chỉ dùng khi DEV
+  // DEV ONLY
+  // Production thì nên bỏ log OTP
   console.log("OTP:", otp);
+
+  // ----------------------------------------
+  // MARK PROCESSED
+  // ----------------------------------------
 
   processedMessageIds.add(messageId);
 }
@@ -253,6 +280,7 @@ function getLatestOtp() {
     return null;
   }
 
+  // OTP hết hạn
   if (otpExpiredAt && Date.now() > otpExpiredAt) {
     latestOtp = null;
     otpExpiredAt = null;
@@ -284,9 +312,14 @@ function extractBody(part) {
     return null;
   }
 
+  // ----------------------------------------
+  // Body trực tiếp
+  // ----------------------------------------
+
   if (part.body?.data) {
     let body = Buffer.from(part.body.data, "base64url").toString("utf8");
 
+    // HTML -> plain text đơn giản
     if (part.mimeType === "text/html") {
       body = body.replace(/<[^>]*>/g, " ");
     }
@@ -296,7 +329,10 @@ function extractBody(part) {
 
   const parts = part.parts || [];
 
-  // ưu tiên text/plain
+  // ----------------------------------------
+  // Ưu tiên text/plain
+  // ----------------------------------------
+
   for (const child of parts) {
     if (child.mimeType === "text/plain") {
       const body = extractBody(child);
@@ -307,7 +343,10 @@ function extractBody(part) {
     }
   }
 
-  // recursive fallback
+  // ----------------------------------------
+  // Recursive fallback
+  // ----------------------------------------
+
   for (const child of parts) {
     const body = extractBody(child);
 
@@ -324,11 +363,19 @@ function extractBody(part) {
 // ==========================================
 
 function extractOtp(body) {
+  // ----------------------------------------
+  // Pattern chính xác của VNA
+  // ----------------------------------------
+
   let matcher = body.match(VNA_OTP_PATTERN);
 
   if (matcher) {
     return matcher[1];
   }
+
+  // ----------------------------------------
+  // Fallback số 6 chữ số
+  // ----------------------------------------
 
   matcher = body.match(SIX_DIGIT_PATTERN);
 
@@ -338,6 +385,10 @@ function extractOtp(body) {
 
   return null;
 }
+
+// ==========================================
+// EXPORT
+// ==========================================
 
 export default {
   watch,
