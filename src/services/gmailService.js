@@ -198,11 +198,18 @@ async function processMessage(messageId) {
 
   const date = getHeader(headers, "Date");
 
+  const to = getHeader(headers, "To");
+  const deliveredTo = getHeader(headers, "Delivered-To");
+  const originalTo = getHeader(headers, "X-Original-To");
+
   console.log("Gmail message:", {
     messageId,
     from,
-    subject,
+    to,
     date,
+    deliveredTo,
+    originalTo,
+    subject,
   });
 
   // ----------------------------------------
